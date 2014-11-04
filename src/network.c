@@ -482,6 +482,31 @@ void create_bound_listener(struct listener **listeners, struct irec *iface)
 }
 
 /**
+ * If a listener has a struct irec pointer whose address matches the newly
+ * malloc()d struct irec's address, update its pointer to refer to this new
+ * struct irec instance.
+ *
+ * Otherwise, any listeners that are preserved across interface list changes
+ * will point at interface structures that are free()d at the end of
+ * set_interfaces(), and can get overwritten by subsequent memory allocations.
+ *
+ * See b/17475756 for further discussion.
+ */
+void fixup_possible_existing_listener(struct irec *new_iface) {
+  /* find the listener, if present */
+  struct listener *l;
+  for (l = daemon->listeners; l; l = l->next) {
+    struct irec *listener_iface = l->iface;
+    if (listener_iface) {
+      if (sockaddr_isequal(&listener_iface->addr, &new_iface->addr)) {
+        l->iface = new_iface;
+        return;
+      }
+    }
+  }
+}
+
+/**
  * Close the sockets listening on the given interface
  *
  * This new function is needed as we're dynamically changing the interfaces
@@ -683,7 +708,7 @@ int random_sock(int family)
 }
   
 
-int local_bind(int fd, union mysockaddr *addr, char *intname, int is_tcp)
+int local_bind(int fd, union mysockaddr *addr, char *intname, uint32_t mark, int is_tcp)
 {
   union mysockaddr addr_copy = *addr;
 
@@ -707,10 +732,13 @@ int local_bind(int fd, union mysockaddr *addr, char *intname, int is_tcp)
     return 0;
 #endif
 
+  if (mark != 0 && setsockopt(fd, SOL_SOCKET, SO_MARK, &mark, sizeof(mark)) == -1)
+    return 0;
+
   return 1;
 }
 
-static struct serverfd *allocate_sfd(union mysockaddr *addr, char *intname)
+static struct serverfd *allocate_sfd(union mysockaddr *addr, char *intname, uint32_t mark)
 {
   struct serverfd *sfd;
   int errsave;
@@ -737,6 +765,7 @@ static struct serverfd *allocate_sfd(union mysockaddr *addr, char *intname)
   /* may have a suitable one already */
   for (sfd = daemon->sfds; sfd; sfd = sfd->next )
     if (sockaddr_isequal(&sfd->source_addr, addr) &&
+	mark == sfd->mark &&
 	strcmp(intname, sfd->interface) == 0)
       return sfd;
   
@@ -751,7 +780,7 @@ static struct serverfd *allocate_sfd(union mysockaddr *addr, char *intname)
       return NULL;
     }
   
-  if (!local_bind(sfd->fd, addr, intname, 0) || !fix_fd(sfd->fd))
+  if (!local_bind(sfd->fd, addr, intname, mark, 0) || !fix_fd(sfd->fd))
     { 
       errsave = errno; /* save error from bind. */
       close(sfd->fd);
@@ -762,6 +791,7 @@ static struct serverfd *allocate_sfd(union mysockaddr *addr, char *intname)
     
   strcpy(sfd->interface, intname); 
   sfd->source_addr = *addr;
+  sfd->mark = mark;
   sfd->next = daemon->sfds;
   daemon->sfds = sfd;
   return sfd; 
@@ -783,7 +813,7 @@ void pre_allocate_sfds(void)
 #ifdef HAVE_SOCKADDR_SA_LEN
       addr.in.sin_len = sizeof(struct sockaddr_in);
 #endif
-      allocate_sfd(&addr, "");
+      allocate_sfd(&addr, "", 0);
 #ifdef HAVE_IPV6
       memset(&addr, 0, sizeof(addr));
       addr.in6.sin6_family = AF_INET6;
@@ -792,13 +822,13 @@ void pre_allocate_sfds(void)
 #ifdef HAVE_SOCKADDR_SA_LEN
       addr.in6.sin6_len = sizeof(struct sockaddr_in6);
 #endif
-      allocate_sfd(&addr, "");
+      allocate_sfd(&addr, "", 0);
 #endif
     }
   
   for (srv = daemon->servers; srv; srv = srv->next)
     if (!(srv->flags & (SERV_LITERAL_ADDRESS | SERV_NO_ADDR)) &&
-	!allocate_sfd(&srv->source_addr, srv->interface) &&
+	!allocate_sfd(&srv->source_addr, srv->interface, srv->mark) &&
 	errno != 0 &&
 	(daemon->options & OPT_NOWILD))
       {
@@ -848,7 +878,7 @@ void check_servers(void)
 	  
 	  /* Do we need a socket set? */
 	  if (!new->sfd && 
-	      !(new->sfd = allocate_sfd(&new->source_addr, new->interface)) &&
+	      !(new->sfd = allocate_sfd(&new->source_addr, new->interface, new->mark)) &&
 	      errno != 0)
 	    {
 	      my_syslog(LOG_WARNING, 
@@ -920,7 +950,7 @@ void set_interfaces(const char *interfaces)
     strncpy(s, interfaces, sizeof(s));
     while((interface = strsep(&next, ":"))) {
         if_tmp = safe_malloc(sizeof(struct iname));
-        memset(if_tmp, sizeof(struct iname), 0);
+        memset(if_tmp, 0, sizeof(struct iname));
         if ((if_tmp->name = strdup(interface)) == NULL) {
             die(_("malloc failure in set_interfaces: %s"), NULL, EC_BADNET);
         }
@@ -943,11 +973,14 @@ void set_interfaces(const char *interfaces)
       int found = 0;
       for (new_iface = daemon->interfaces; new_iface; new_iface = new_iface->next) {
         if (sockaddr_isequal(&old_iface->addr, &new_iface->addr)) {
-            found = -1;
+            found = 1;
             break;
         }
       }
-      if (!found) {
+
+      if (found) {
+        fixup_possible_existing_listener(new_iface);
+      } else {
 #ifdef __ANDROID_DEBUG__
         char debug_buff[MAXDNAME];
         prettyprint_addr(&old_iface->addr, debug_buff);
@@ -1017,7 +1050,9 @@ void set_interfaces(const char *interfaces)
 }
 
 /*
- * Takes a string in the format "1.2.3.4:1.2.3.4:..." - up to 1024 bytes in length
+ * Takes a string in the format "0x100b:1.2.3.4:1.2.3.4:..." - up to 1024 bytes in length
+ *  - The first element is the socket mark to set on sockets that forward DNS queries.
+ *  - The subsequent elements are the DNS servers to forward queries to.
  */
 int set_servers(const char *servers)
 {
@@ -1025,6 +1060,8 @@ int set_servers(const char *servers)
   struct server *old_servers = NULL;
   struct server *new_servers = NULL;
   struct server *serv;
+  char *mark_string;
+  uint32_t mark;
 
   strncpy(s, servers, sizeof(s));
 
@@ -1049,10 +1086,14 @@ int set_servers(const char *servers)
       serv = tmp;
     }
 
-    char *next = s;
-    char *saddr;
+  char *next = s;
+  char *saddr;
 
- while ((saddr = strsep(&next, ":"))) {
+  /* Parse the mark. */
+  mark_string = strsep(&next, ":");
+  mark = strtoul(mark_string, NULL, 0);
+
+  while ((saddr = strsep(&next, ":"))) {
       union mysockaddr addr, source_addr;
       memset(&addr, 0, sizeof(addr));
       memset(&source_addr, 0, sizeof(source_addr));
@@ -1098,6 +1139,7 @@ int set_servers(const char *servers)
       serv->source_addr = source_addr;
       serv->domain = NULL;
       serv->interface[0] = 0;
+      serv->mark = mark;
       serv->sfd = NULL;
       serv->flags = SERV_FROM_RESOLV;
       serv->queries = serv->failed_queries = 0;
@@ -1211,6 +1253,7 @@ int reload_servers(char *fname)
       serv->source_addr = source_addr;
       serv->domain = NULL;
       serv->interface[0] = 0;
+      serv->mark = 0;
       serv->sfd = NULL;
       serv->flags = SERV_FROM_RESOLV;
       serv->queries = serv->failed_queries = 0;
